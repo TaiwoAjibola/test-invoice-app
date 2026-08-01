@@ -1,7 +1,7 @@
-/* BACKEND COMMENTED OUT FOR UX WORK
 import express from "express";
 import { supabase } from "../db.js";
 import { notifyProfiles } from "../notify.js";
+import { buildosFetch, isBuildosConfigured } from "../buildosClient.js";
 const router = express.Router();
 
 // Supplier submits a counter-offer
@@ -79,6 +79,50 @@ router.patch("/:id/accept", async (req, res) => {
   } catch (notifyErr) {
     console.error("notifyProfiles failed:", notifyErr);
   }
+
+  // Push the accepted amount to BuildOS as a purchase invoice.
+  //
+  // The previous payload could never be stored: it sent `amount`, `currency`
+  // and `linkedPrId`, none of which exist on BuildOS's PurchaseInvoice model
+  // (the amount column is `total`), and omitted the required `supplierName` and
+  // `invoiceDate` — so Prisma rejected every call. It also guessed the linked
+  // purchase request by taking the supplier's most recent buildos_ref, which is
+  // wrong as soon as a supplier has more than one open request.
+  if (isBuildosConfigured()) {
+    try {
+      const [{ data: invoice }, { data: profile }] = await Promise.all([
+        supabase
+          .from("invoices")
+          .select("invoice_number, currency, total")
+          .eq("id", neg.invoice_id)
+          .single(),
+        supabase
+          .from("profiles")
+          .select("name, company, buildos_supplier_id")
+          .eq("id", neg.sender_profile_id)
+          .maybeSingle(),
+      ]);
+
+      await buildosFetch("/purchase-invoices", {
+        method: "POST",
+        body: {
+          supplierId: profile?.buildos_supplier_id || null,
+          supplierName: profile?.company || profile?.name || "Unknown supplier",
+          poRef: null,
+          invoiceDate: new Date().toISOString(),
+          lines: [],
+          subtotal: neg.proposed_total,
+          vatTotal: 0,
+          total: neg.proposed_total,
+          status: "Pending",
+          notes: `SabiQuot invoice ${invoice?.invoice_number ?? neg.invoice_id} — accepted counter-offer (${invoice?.currency || "NGN"})`,
+        },
+      });
+    } catch (buildosErr) {
+      console.error("BuildOS sync failed:", buildosErr.message);
+    }
+  }
+
   res.json(neg);
 });
 
@@ -105,5 +149,32 @@ router.patch("/:id/reject", async (req, res) => {
   res.json(neg);
 });
 
+// GET /api/negotiate/:id/messages — fetch the message thread for a negotiation
+router.get("/:id/messages", async (req, res) => {
+  const { data, error } = await supabase
+    .from("negotiation_messages")
+    .select("*, profiles(name, company, role)")
+    .eq("negotiation_id", req.params.id)
+    .order("created_at", { ascending: true });
+  if (error) return res.status(400).json({ error: error.message });
+  res.json(data);
+});
+
+// POST /api/negotiate/:id/messages — send a message in a negotiation thread
+router.post("/:id/messages", async (req, res) => {
+  const { sender_profile_id, content } = req.body;
+  if (!sender_profile_id || !content) {
+    return res
+      .status(400)
+      .json({ error: "sender_profile_id and content are required" });
+  }
+  const { data, error } = await supabase
+    .from("negotiation_messages")
+    .insert([{ negotiation_id: req.params.id, sender_profile_id, content }])
+    .select()
+    .single();
+  if (error) return res.status(400).json({ error: error.message });
+  res.status(201).json(data);
+});
+
 export default router;
-BACKEND COMMENTED OUT FOR UX WORK */
